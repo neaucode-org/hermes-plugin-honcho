@@ -58,19 +58,6 @@ Multi-pass `.chat()` reasoning about the user, appended after base context.
 
 Both layers are joined, then truncated to fit `contextTokens` budget via `_truncate_to_budget` (tokens × 4 chars, word-boundary safe).
 
-**Optional — Passive turn recall** (`turnRecall`, off by default): a third, short section appended after the other layers, `## Related past turns`, listing the best-matching past messages as pointers. It runs the same message search as `honcho_search` on the turn's query (rewritten when `queryRewrite` is on), once per `contextCadence`, on a background thread that never holds the turn. Hits from the current Hermes session, hits without a `hermes_message_id` and duplicate (session, message) pairs are dropped. One line per hit: `- 2026-10-30 [assistant] Done. Trial step removed ... (@session:default/124a0ce85ac2 #90000)`, where the profile is the message's `hermes_profile` metadata when present, else `default`. Hybrid and context recall modes only; `recallSync` hosts skip it.
-
-| Key (`turnRecall.*`) | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | `false` | Turn the section on for this host |
-| `limit` | int | `3` | Pointers kept after filtering (the search asks for `limit + 3`) |
-| `excerptChars` | int | `120` | Excerpt length per pointer, one line, cut with `...` |
-| `maxTokens` | int | `300` | Cap for the whole section (tokens × 4 chars) |
-
-```json
-"hosts": { "hermes": { "turnRecall": { "enabled": true, "limit": 3, "excerptChars": 120, "maxTokens": 300 } } }
-```
-
 ### Current-Query Recall (opt-in)
 
 Set `"recallSync": true` in `$HERMES_HOME/honcho.json` (at the root or under
