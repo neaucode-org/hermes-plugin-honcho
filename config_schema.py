@@ -56,6 +56,8 @@ CONFIG_SCHEMA = ProviderConfigSchema(
         # — Connection —
         _field("timeout", "Request timeout", KIND_NUMBER, "Request timeout in seconds for Honcho HTTP calls. Blank uses the default.",
                aliases=("requestTimeout",), env_fallbacks=("HONCHO_TIMEOUT",), placeholder="30", group="Connection", scope="root"),
+        _field("searchTimeout", "Search timeout", KIND_NUMBER, "Max seconds one honcho_search call may block a turn before it reports a timeout. 0 disables the cap.",
+               default="20", placeholder="20", group="Connection"),
         # — Identity —
         _field("pinUserPeer", "Pin user peer", KIND_BOOL, "Pin the user peer to the peer name, ignoring gateway runtime identity. Unifies memory for single-user setups.",
                default="false", aliases=("pinPeerName",), group="Identity"),

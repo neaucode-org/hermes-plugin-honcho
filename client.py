@@ -329,6 +329,7 @@ def _behavior_fields(look: _HostLookup, explicitly_configured: bool) -> dict[str
         "query_rewrite": look.flag("queryRewrite", default=False),
         "first_turn_base_wait": look.parsed("firstTurnBaseWait", lambda v: max(0.0, float(v)), 3.0),
         "first_turn_dialectic_wait": look.parsed("firstTurnDialecticWait", lambda v: max(0.0, float(v)), 2.0),
+        "search_timeout": look.parsed("searchTimeout", lambda v: max(0.0, float(v)), 20.0),
         "observation_mode": observation_mode,
         **_resolve_observation(observation_mode, look.pick("observation")),
         "session_strategy": look.pick("sessionStrategy", "per-directory"),
@@ -387,6 +388,9 @@ class HonchoClientConfig:
     # Bounded synchronous waits on turn 1, seconds; 0 = fully async first turn.
     first_turn_base_wait: float = 3.0
     first_turn_dialectic_wait: float = 2.0
+    # Wall-clock cap on one honcho_search tool call, seconds; 0 = uncapped. The SDK has no per-call
+    # timeout and retries, so a stalled embedder could otherwise hold the chat for timeout x attempts.
+    search_timeout: float = 20.0
     # Legacy string shorthand; the granular per-peer booleans below are preferred
     # and map 1:1 to Honcho's SessionPeerConfig.
     observation_mode: str = "directional"

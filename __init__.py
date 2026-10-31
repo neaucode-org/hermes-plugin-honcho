@@ -928,11 +928,49 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         return json.dumps({"result": card} if card else self._empty_profile_hint(peer))
 
     def _tool_search(self, args: dict) -> str:
+        from .session import HonchoAuthError
+
+        try:
+            return self._tool_search_capped(args)
+        except HonchoAuthError:
+            raise  # rendered by handle_tool_call's auth-specific handler
+        except Exception as e:
+            # search_context(raise_errors=True) raises instead of returning "": a failed lookup is not a miss.
+            logger.warning("honcho_search failed: %s", e)
+            return tool_error(
+                f"Honcho search failed ({e}). This is a backend error, not an empty result — "
+                "the memory may still exist. Retry later.")
+
+    def _tool_search_capped(self, args: dict) -> str:
         if not (query := (args.get("query") or "").strip()):
             return tool_error("Missing required parameter: query")
         max_tokens = min(int(args.get("max_tokens", 800)), 2000)
-        result = self._manager.search_context(self._session_key, query, max_tokens=max_tokens, peer=args.get("peer", "user"))
-        return json.dumps({"result": result or "No relevant context found."})
+        manager, session_key, peer = self._manager, self._session_key, args.get("peer", "user")
+        cap = float(getattr(self._config, "search_timeout", 0.0) or 0.0)
+        if cap <= 0:
+            result = manager.search_context(session_key, query, max_tokens=max_tokens, peer=peer, raise_errors=True)
+            return json.dumps({"result": result or "No relevant context found."})
+        # The SDK has no per-call timeout: run the search on an owned daemon thread and stop waiting at the
+        # cap. A late thread finishes on its own (bounded by the HTTP timeout) and shutdown joins it.
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["result"] = manager.search_context(session_key, query, max_tokens=max_tokens, peer=peer, raise_errors=True)
+            except BaseException as e:  # noqa: BLE001 — re-raised on the caller's thread
+                box["error"] = e
+
+        thread = spawn_context_thread(_run, name="honcho-search", owner=self)
+        thread.start()
+        thread.join(timeout=cap)
+        if thread.is_alive():
+            logger.warning("honcho_search failed: timed out after %gs (searchTimeout)", cap)
+            return tool_error(
+                f"Honcho search timed out after {cap:g}s. This is a backend delay, not an empty result — "
+                "the memory may still exist. Retry later, or raise 'searchTimeout' in honcho.json.")
+        if "error" in box:
+            raise box["error"]
+        return json.dumps({"result": box.get("result") or "No relevant context found."})
 
     def _tool_reasoning(self, args: dict) -> str:
         from .session import HonchoAuthError
