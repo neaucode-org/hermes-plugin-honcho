@@ -23,7 +23,6 @@ from agent.memory_provider import MemoryProvider, is_trivial_prompt
 from agent.coding_context import INTERACTIVE_CODING_PLATFORMS as _LOCAL_PLATFORMS
 from agent.turn_author import a2a_key
 from .client import HonchoClientConfig, resolve_config_path
-from .turn_recall import OVERFETCH as _TURN_RECALL_OVERFETCH, TurnRecallConfig, render_section as _render_turn_recall
 from .client import _host_block, _HostLookup
 from .client import join_plugin_threads, spawn_context_thread
 from .dialectic import DialecticMixin
@@ -196,13 +195,6 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         # Base context cache — refreshed on context_cadence, not frozen.
         self._base_context_cache: Optional[str] = None
         self._base_context_lock = threading.Lock()
-        # Passive turn recall (turnRecall): pointers to related past messages, appended after the facts.
-        # The section is built in the background on the context cadence and consumed once, next turn.
-        self._turn_recall = TurnRecallConfig()
-        self._turn_recall_ready: Optional[tuple[str, int]] = None  # (section, turn it was fired at)
-        self._turn_recall_thread: Optional[threading.Thread] = None
-        self._turn_recall_lock = threading.Lock()
-        self._hermes_session_id = ""  # current Hermes session, from the session_id hook kwarg
 
         # Recall cadence state (overwritten from config in initialize()).
         self._turn_count = 0
@@ -312,7 +304,6 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
                          "dialectic_depth_levels", "reasoning_heuristic"):
                 setattr(self, f"_{name}", getattr(cfg, name))
             self._query_rewrite_enabled = cfg.query_rewrite
-            self._turn_recall = TurnRecallConfig.from_block(look.present("turnRecall"))
             self._FIRST_TURN_BASE_TIMEOUT = cfg.first_turn_base_wait
             self._FIRST_TURN_DIALECTIC_CAP = cfg.first_turn_dialectic_wait
             self._dialectic_depth = max(1, min(cfg.dialectic_depth, 3))
@@ -667,10 +658,6 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             ready = self._consume_pending_dialectic()
             return self._log_injection("trivial-prompt", self._truncate_to_budget(ready) if ready else "")
 
-        session_id = self._note_hermes_session(session_id)
-        # Turn 1 has no queued recall yet: start it now, in parallel with the base fetch.
-        recall_thread = (self._spawn_turn_recall(query, session_id)
-                         if first_turn_base_deadline is not None and self._turn_recall_active() else None)
         # One-time notice, relayed by the model, that auth is dead and memory is paused.
         parts = [self._pop_auth_notice()]
         # First-turn mode suppresses only the base layer; dialectic is independent.
@@ -679,76 +666,10 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._first_turn_dialectic_wait(query)
         # Consume only results that are already ready; later turns never wait.
         parts.append(self._consume_pending_dialectic())
-        if recall_thread is not None:
-            recall_thread.join(timeout=max(0.0, first_turn_base_deadline - time.monotonic()))
-        parts.append(self._consume_turn_recall())
         parts = [p for p in parts if p and p.strip()]
         if not parts:
             return self._log_injection("fetched-but-empty")
         return self._log_injection("injected", self._truncate_to_budget("\n\n".join(parts)))
-
-    def _note_hermes_session(self, session_id: str) -> str:
-        """Remember the current Hermes session id (hook kwarg) and return the one in effect."""
-        if session_id:
-            self._hermes_session_id = session_id
-        return self._hermes_session_id
-
-    def _turn_recall_active(self) -> bool:
-        """turnRecall is on and the recall mode injects (hybrid/context), not tools-only or cron."""
-        return (self._turn_recall.enabled and self._recall_mode in {"hybrid", "context"}
-                and not self._cron_skipped and not self._recall_sync)
-
-    def _build_turn_recall(self, query: str, hermes_session_id: str) -> str:
-        """Search past messages on the (rewritten) query and render the section; "" when disabled, on no
-        surviving hit, or on any failure (logged at debug: this layer is optional)."""
-        cfg = self._turn_recall
-        if not cfg.enabled or not self._manager or not (query or "").strip():
-            return ""
-        try:
-            search_query = query
-            if self._query_rewrite_enabled and self._query_rewriter:
-                try:
-                    search_query = self._query_rewriter(query).strip() or query
-                except Exception as exc:
-                    logger.debug("Honcho query rewriter failed: %s", exc)
-            hits = self._manager.recall_hits(self._session_key, search_query, limit=cfg.limit + _TURN_RECALL_OVERFETCH)
-            return _render_turn_recall(hits, cfg, current_session_id=hermes_session_id)
-        except Exception as exc:
-            logger.debug("Honcho turn recall failed: %s", exc)
-            return ""
-
-    def _spawn_turn_recall(self, query: str, hermes_session_id: str) -> Optional[threading.Thread]:
-        """Build the section on a background thread and park it for the next prefetch. One at a time."""
-        if not self._turn_recall_active() or not query:
-            return None
-        live = self._turn_recall_thread
-        if live is not None and live.is_alive():
-            logger.debug("Honcho turn recall skipped: prior search still running")
-            return None
-        fired_at, generation, session_key = self._turn_count, self._recall_generation, self._session_key
-
-        def _run() -> None:
-            section = self._build_turn_recall(query, hermes_session_id)
-            if section and generation is self._recall_generation and session_key == self._session_key:
-                with self._turn_recall_lock:
-                    self._turn_recall_ready = (section, fired_at)
-
-        thread = spawn_context_thread(_run, name="honcho-turn-recall", owner=self)
-        thread.start()
-        self._turn_recall_thread = thread
-        return thread
-
-    def _consume_turn_recall(self) -> str:
-        """Pop the parked section: "" when none is ready or it is older than the stale limit. Never waits."""
-        with self._turn_recall_lock:
-            ready, self._turn_recall_ready = self._turn_recall_ready, None
-        if not ready:
-            return ""
-        section, fired_at = ready
-        if (self._turn_count - fired_at) > max(1, self._context_cadence) * self._STALE_RESULT_MULTIPLIER:
-            logger.debug("Honcho turn recall discarded as stale: fired_at=%d, turn=%d", fired_at, self._turn_count)
-            return ""
-        return section
 
     def _pop_auth_notice(self) -> str:
         """One-time model-facing notice that Honcho auth expired and memory is paused."""
@@ -817,7 +738,6 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
                 self._manager.prefetch_context(self._session_key, query)
             except Exception as e:
                 logger.debug("Honcho context prefetch failed: %s", e)
-            self._spawn_turn_recall(query, self._note_hermes_session(session_id))
 
         # Dialectic layer: a hung call older than timeout × multiplier counts as dead.
         if self._thread_is_live():

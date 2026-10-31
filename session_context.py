@@ -221,44 +221,6 @@ class SessionContextMixin:
             return card or (self._fetch_peer_card(target_peer_id) if target_peer_id else [])
         return self._guarded_session(session_key, _fetch, [], logging.DEBUG, "Failed to fetch peer card from Honcho: %s")
 
-    def _search_messages(self, session: Any, q: str, peer: str, limit: int, raise_errors: bool = False) -> Any:
-        """Hybrid message search from ``peer``'s perspective across all sessions: the raw hits (None/[] on a miss).
-        Shared by honcho_search (search_context) and passive turn recall (recall_hits)."""
-        peer_id = self._resolve_peer_id(session, peer)
-        messages = self._guarded_authed(
-            "message search", lambda: self.honcho.search(q, filters={"peer_perspective": peer_id}, limit=limit),
-            _FAILED, logging.DEBUG, "Honcho message search failed (peer_perspective=%s): %s", peer_id,
-        )
-        if messages is _FAILED:
-            # Older Honcho versions lack the perspective filter; fall back to peer-authored search.
-            def _peer_search() -> Any:
-                return self._authed_call("peer search", lambda: self._get_or_create_peer(peer_id).search(q, limit=limit))
-            messages = _peer_search() if raise_errors else self._guarded(
-                _peer_search, None, logging.DEBUG, "Honcho peer search fallback also failed: %s")
-        return messages
-
-    def recall_hits(self, session_key: str, query: str, *, limit: int, peer: str = "user") -> list[dict[str, Any]]:
-        """Message search hits as plain dicts for passive turn recall, in rank order. [] when the session is
-        missing, the query is empty or the search fails (logged at debug); raises HonchoAuthError."""
-        session = self._cached_session(session_key)
-        q = (query or "").strip()[:4000]
-        if not session or not q:
-            return []
-        hits: list[dict[str, Any]] = []
-        for m in self._search_messages(session, q, peer, limit) or []:
-            meta = getattr(m, "metadata", None)
-            meta = meta if isinstance(meta, dict) else {}
-            author = getattr(m, "peer_id", "") or "unknown"
-            hits.append({
-                "content": getattr(m, "content", "") or "",
-                "author": "assistant" if author == session.assistant_peer_id else author,
-                "created_at": getattr(m, "created_at", None),
-                "hermes_session_id": meta.get("hermes_session_id"),
-                "hermes_message_id": meta.get("hermes_message_id"),
-                "hermes_profile": meta.get("hermes_profile"),
-            })
-        return hits
-
     def search_context(
         self, session_key: str, query: str, max_tokens: int = 800, peer: str = "user", raise_errors: bool = False,
     ) -> str:
@@ -271,9 +233,19 @@ class SessionContextMixin:
         q = (query or "").strip()[:4000]  # Honcho caps query length for the embedding model.
         if not session or not q:
             return ""
+        peer_id = self._resolve_peer_id(session, peer)
         char_budget = max(200, int(max_tokens) * 4)
         limit = max(3, min(20, char_budget // 300))
-        messages = self._search_messages(session, q, peer, limit, raise_errors)
+        messages = self._guarded_authed(
+            "message search", lambda: self.honcho.search(q, filters={"peer_perspective": peer_id}, limit=limit),
+            _FAILED, logging.DEBUG, "Honcho message search failed (peer_perspective=%s): %s", peer_id,
+        )
+        if messages is _FAILED:
+            # Older Honcho versions lack the perspective filter; fall back to peer-authored search.
+            def _peer_search() -> Any:
+                return self._authed_call("peer search", lambda: self._get_or_create_peer(peer_id).search(q, limit=limit))
+            messages = _peer_search() if raise_errors else self._guarded(
+                _peer_search, None, logging.DEBUG, "Honcho peer search fallback also failed: %s")
         if not messages:
             return ""
         # Author labels distinguish user-stated facts from assistant-derived ones.

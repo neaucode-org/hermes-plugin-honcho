@@ -115,12 +115,6 @@ CONFIG_SCHEMA = ProviderConfigSchema(
                "Pin which base-context sections the first turn injects: summary, peerRepresentation, peerCard, "
                "aiRepresentation, aiCard. Blank injects all of them; an empty list injects nothing.",
                placeholder='{"sessionStart": ["summary", "peerCard"]}', group="Recall"),
-        # The plugin reads `turnRecall` as one object, so the panel edits the whole block.
-        _field("turnRecall", "Passive turn recall", KIND_JSON,
-               "Append a short \"Related past turns\" list (dated pointers with session and message ids) to the "
-               "injected memory block, from a message search on the turn's query. Keys: enabled (default false), "
-               "limit (3), excerptChars (120), maxTokens (300). Runs on contextCadence; hybrid and context modes only.",
-               placeholder='{"enabled": true, "limit": 3, "excerptChars": 120, "maxTokens": 300}', group="Recall"),
         _field("initOnSessionStart", "Eager init", KIND_BOOL, "Initialize the session eagerly in tools mode instead of on first tool call.",
                default="false", group="Recall"),
         # — Limits —
