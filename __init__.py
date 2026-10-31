@@ -469,6 +469,15 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             self._start_session_init_background()
         return False
 
+    def _ready_for_turn_write(self) -> bool:
+        """``_ready_or_kick_init`` for ``sync_turn``. Tools mode also initializes lazily on the first
+        turn write, so saveMessages stores a session whose agent never called a Honcho tool (a kanban
+        worker's single turn would otherwise be dropped). The init blocks, which is safe here:
+        ``sync_turn`` runs on the memory manager's background worker, never inline in the turn."""
+        if self._recall_mode == "tools" and not self._session_ready():
+            return self._ensure_session()
+        return self._ready_or_kick_init()
+
     # ----- Prompt / prefetch -----
 
     @staticmethod
@@ -839,7 +848,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if _is_internal_gateway_turn(user_content):
             logger.debug("Honcho sync skipped machine-generated gateway turn")
             return
-        if not self._ready_or_kick_init():
+        if not self._ready_for_turn_write():
             return
 
         msg_limit = self._config.message_max_chars if self._config else 25000
