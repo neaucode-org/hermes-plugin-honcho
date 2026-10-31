@@ -40,10 +40,8 @@ SEARCH_SCHEMA = _tool(
     "peer), no LLM synthesis. Cheaper and faster than honcho_reasoning. "
     "Use this to recall specific past facts — 'what did I say about X', "
     "'what was the regimen/decision/config we settled on' — and reason "
-    "over the excerpts yourself. Each excerpt is labeled "
-    "[author · honcho session · hermes_session_id=… hermes_message_id=…]; "
-    "the hermes ids name the exact Hermes session and state.db message row. "
-    "For nuanced questions needing synthesis, use honcho_reasoning instead.",
+    "over the excerpts yourself. For nuanced questions needing synthesis, "
+    "use honcho_reasoning instead.",
     {"query": {"type": "string",
                "description": "What to look for — a topic, keyword, name, or natural-language description of the fact you're trying to recall."},
      "max_tokens": {"type": "integer",

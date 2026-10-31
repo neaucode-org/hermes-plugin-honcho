@@ -161,7 +161,7 @@ Five bidirectional tools. All accept an optional `peer` parameter (`"user"` or `
 | Tool | LLM call? | Description |
 |------|-----------|-------------|
 | `honcho_profile` | No | Peer card — key facts snapshot |
-| `honcho_search` | No | Cross-session message search (hybrid semantic + keyword, ranked excerpts; 800 tok default, 2000 max). Each hit is labeled `[author · honcho session · hermes_session_id=… hermes_message_id=…]`: every stored turn carries message `metadata` `hermes_session_id` and `hermes_message_id` (the Hermes `state.db` `messages.id`), read from the `_row_id` the harness stamps on the persisted transcript passed to `sync_turn` |
+| `honcho_search` | No | Cross-session message search (hybrid semantic + keyword, ranked excerpts; 800 tok default, 2000 max); hits name their Hermes session and `state.db` message row |
 | `honcho_context` | No | Full session context: summary, representation, card, messages |
 | `honcho_reasoning` | Yes | LLM-synthesized answer via dialectic `.chat()` |
 | `honcho_conclude` | No | Write, list/search, or delete persistent conclusions (list surfaces the ids delete needs) |
