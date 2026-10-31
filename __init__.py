@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import threading
 import time
@@ -331,9 +332,15 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
     def _resolve_session_key(self, cfg, session_id: str, **kwargs) -> str:
         """Resolve the Honcho session key without touching the network."""
-        from agent.runtime_cwd import resolve_agent_cwd
-
-        cwd = kwargs.get("cwd") or str(resolve_agent_cwd())
+        cwd = kwargs.get("cwd")
+        if not cwd:
+            # A worker spawned into a workspace that no longer exists makes os.getcwd()
+            # raise; the session key must still resolve (per-session needs no cwd at all).
+            try:
+                from agent.runtime_cwd import resolve_agent_cwd
+                cwd = str(resolve_agent_cwd())
+            except OSError:
+                cwd = str(Path.home())
         return cfg.resolve_session_name(
             cwd=cwd,
             session_title=kwargs.get("session_title"), session_id=session_id,

@@ -526,7 +526,11 @@ class HonchoClientConfig:
         def _slug(text: str) -> str:
             return re.sub(r'[^a-zA-Z0-9_-]+', '-', text).strip('-')
 
-        cwd = cwd or os.getcwd()
+        if not cwd:
+            try:
+                cwd = os.getcwd()
+            except OSError:
+                cwd = str(Path.home())
         if gateway_session_key and _slug(gateway_session_key):
             return self._enforce_session_id_limit(_slug(gateway_session_key), gateway_session_key)
         if self.session_strategy == "per-session" and session_id:
