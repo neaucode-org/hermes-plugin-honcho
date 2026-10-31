@@ -368,7 +368,6 @@ Host key is derived from the active Hermes profile: `hermes` (default) or `herme
 | `queryRewrite` | bool | `false` | Rewrite the latest message into a retrieval query before dialectic (one extra auxiliary LLM call per cycle) |
 | `firstTurnBaseWait` | float | `3.0` | Max seconds turn 1 waits for base context / session init. `0` disables the wait (fully async; context surfaces on later turns). Turns 2+ never wait on a stalled init |
 | `firstTurnDialecticWait` | float | `2.0` | Max seconds turn 1 waits for a dialectic result. `0` disables |
-| `searchTimeout` | float | `20.0` | Max seconds one `honcho_search` tool call may hold the turn; past it the tool returns a timeout error (not "no context") and the search finishes in the background. `0` disables the cap |
 
 ### Observation (Granular)
 
