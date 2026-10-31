@@ -27,6 +27,7 @@ completes once you approve there. The desktop app offers the browser flow as
 a **Connect** link next to the memory-provider dropdown.
 
 Or manually:
+
 ```bash
 hermes config set memory.provider honcho
 echo "HONCHO_API_KEY=***" >> ~/.hermes/.env
@@ -45,6 +46,7 @@ Context is injected into the **user message** at API-call time (not the system p
 Two independent layers, each on its own cadence:
 
 **Layer 1 — Base context** (refreshed every `contextCadence` turns):
+
 1. **SESSION SUMMARY** — from `session.context(summary=True)`, placed first
 2. **User Representation** — Honcho's evolving model of the user
 3. **User Peer Card** — key facts snapshot
@@ -386,6 +388,7 @@ Maps 1:1 to Honcho's per-peer `SessionPeerConfig`. When present, overrides `obse
 | `ai.observeOthers` | `true` | AI peer observes user messages (enables cross-peer dialectic) |
 
 Presets:
+
 - `"directional"` (default): all four `true`
 - `"unified"`: user `observeMe=true`, AI `observeOthers=true`, rest `false`
 

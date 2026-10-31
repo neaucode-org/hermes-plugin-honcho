@@ -2,7 +2,7 @@
 
 This repository is a **handoff copy** of the `honcho` memory provider that shipped inside
 `NousResearch/hermes-agent` under `plugins/memory/honcho/`. Nous Research is moving every memory
-provider out of the core tree; this repo exists so the upstream project (https://honcho.dev)
+provider out of the core tree; this repo exists so the upstream project (<https://honcho.dev>)
 can clone it, take ownership, and submit it to the [Hermes plugin catalog](https://hermes-agent.nousresearch.com/plugins)
 under their own org. It is **not** an officially maintained Nous plugin.
 
