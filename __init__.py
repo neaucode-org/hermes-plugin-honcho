@@ -56,6 +56,62 @@ def _is_internal_gateway_turn(text: str) -> bool:
     return bool(_INTERNAL_GATEWAY_TURN_RE.match(text or ""))
 
 
+def _message_text(message: Dict[str, Any]) -> str:
+    """A transcript message's text: the string content, or its text parts joined (multimodal)."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text").strip()
+    return ""
+
+
+def _row_id(message: Any) -> Optional[int]:
+    """The ``state.db`` ``messages.id`` the harness stamped on a persisted message dict, else None."""
+    row = message.get("_row_id") if isinstance(message, dict) else None
+    return row if isinstance(row, int) and not isinstance(row, bool) else None
+
+
+def _turn_row_ids(messages: Optional[List[Dict[str, Any]]], user_content: str) -> tuple[Optional[int], Optional[int]]:
+    """``(user_row_id, assistant_row_id)`` of the turn that just ended, from the transcript the harness
+    hands ``sync_turn``. The harness persists the turn before syncing, so its rows carry ``_row_id``.
+
+    Assistant: the last persisted assistant message with text (the final response). User: among the
+    persisted user messages since the previous final assistant reply, the one whose text matches
+    ``user_content`` (mid-turn steers and compaction summaries are user rows too), else the nearest."""
+    if not messages:
+        return None, None
+    end, assistant_row = len(messages), None
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, dict) and m.get("role") == "assistant" and _row_id(m) is not None and _message_text(m):
+            end, assistant_row = i, _row_id(m)
+            break
+    wanted = (user_content or "").strip()
+    nearest = None
+    for m in reversed(messages[:end]):
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "assistant" and not m.get("tool_calls") and _message_text(m):
+            break  # the previous turn's final reply bounds this turn
+        if m.get("role") == "user" and (row := _row_id(m)) is not None:
+            text = _message_text(m)
+            if wanted and text and (text == wanted or text.startswith(wanted) or wanted.startswith(text)):
+                return row, assistant_row
+            nearest = row if nearest is None else nearest
+    return nearest, assistant_row
+
+
+def _hermes_message_metadata(hermes_session_id: str, hermes_message_id: Optional[int]) -> Dict[str, Any]:
+    """Honcho message metadata linking a stored message back to its Hermes session and ``state.db`` row."""
+    meta: Dict[str, Any] = {}
+    if hermes_session_id:
+        meta["hermes_session_id"] = hermes_session_id
+    if hermes_message_id is not None:
+        meta["hermes_message_id"] = hermes_message_id
+    return meta
+
+
 def _cfg_usable(cfg) -> bool:
     """Enabled with a credential or a self-hosted URL to talk to."""
     return bool(cfg.enabled and (cfg.api_key or cfg.base_url))
@@ -767,12 +823,17 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
     def sync_turn(
         self, user_content: str, assistant_content: str, *, session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
         turn_author: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Record the conversation turn in Honcho (non-blocking), chunking messages that
         exceed the Honcho API limit. Honors saveMessages: false. ``turn_author`` names who wrote
         the user side. The ``on_turn_start`` stash is the fallback for callers that never pass it.
-        A bot author's turn is written into that bot's own a2a session, never the human's."""
+        A bot author's turn is written into that bot's own a2a session, never the human's.
+
+        Each stored message carries ``metadata`` ``hermes_session_id`` (the Hermes session) and
+        ``hermes_message_id`` (its ``state.db`` ``messages.id`` row), read from the ``_row_id`` the
+        harness stamps on ``messages`` when it persists the turn, so a search hit links to the row."""
         if not self._writes_enabled():
             return
         if _is_internal_gateway_turn(user_content):
@@ -814,12 +875,17 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             # Resolved before the thread starts so a following turn cannot retag a queued write.
             author_peer_id = self._manager.resolve_author_peer_id(session_key, author.get("id"), author.get("name"))
 
+        hermes_session_id = session_id or ""
+        user_row_id, assistant_row_id = _turn_row_ids(messages, user_content)
+        user_meta = _hermes_message_metadata(hermes_session_id, user_row_id)
+        assistant_meta = _hermes_message_metadata(hermes_session_id, assistant_row_id)
+
         def _sync():
             session = self._manager.get_or_create(session_key, **session_kwargs)
             for chunk in self._chunk_message(clean_user_content, msg_limit) if clean_user_content else ():
-                session.add_message("user", chunk, author_peer_id=author_peer_id)
+                session.add_message("user", chunk, author_peer_id=author_peer_id, metadata=dict(user_meta))
             for chunk in self._chunk_message(clean_assistant_content, msg_limit) if clean_assistant_content else ():
-                session.add_message("assistant", chunk)
+                session.add_message("assistant", chunk, metadata=dict(assistant_meta))
             # save() (not _flush_session) so writeFrequency batching is honored.
             self._manager.save(session)
 

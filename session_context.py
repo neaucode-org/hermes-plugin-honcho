@@ -257,7 +257,12 @@ class SessionContextMixin:
             author = getattr(m, "peer_id", "") or "unknown"
             who = "assistant" if author == session.assistant_peer_id else author
             sess = getattr(m, "session_id", "") or ""
-            entry = f"[{who}{f' · {sess}' if sess else ''}] {content[:1200]}"
+            meta = getattr(m, "metadata", None) or {}
+            # Links the hit to its Hermes session and state.db messages.id row (stamped by sync_turn).
+            link = " ".join(f"{k}={meta[k]}" for k in ("hermes_session_id", "hermes_message_id")
+                            if isinstance(meta, dict) and meta.get(k) not in (None, ""))
+            label = " · ".join(part for part in (who, sess, link) if part)
+            entry = f"[{label}] {content[:1200]}"
             # Budget left after the joined snippets so far plus the separator this entry would need.
             remaining = char_budget - len("\n\n".join(lines)) - (2 if lines else 0)
             if remaining <= 0:
