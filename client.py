@@ -334,6 +334,7 @@ def _behavior_fields(look: _HostLookup, explicitly_configured: bool) -> dict[str
         "session_strategy": look.pick("sessionStrategy", "per-directory"),
         "session_peer_prefix": look.pick_set("sessionPeerPrefix", False),
         "a2a_sessions": look.flag("a2aSessions", default=True),
+        "context_line": look.flag("contextLine", default=False),
         "session_ai_peer_prefix": look.pick_set("sessionAiPeerPrefix", False),
     }
 
@@ -399,6 +400,8 @@ class HonchoClientConfig:
     session_peer_prefix: bool = False
     # Bot-authored DMs write into their own session per sender bot.
     a2a_sessions: bool = True
+    # Prepend a one-line thread context, written by the memory_context_line aux task, to each filed turn.
+    context_line: bool = False
     # Prefixes every resolved session name with ``{ai_peer}-``. The gateway_session_key branch is
     # AI-peer-agnostic, so several AI peers sharing one workspace + peerName + chat key would collide.
     session_ai_peer_prefix: bool = False

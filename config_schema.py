@@ -77,6 +77,10 @@ CONFIG_SCHEMA = ProviderConfigSchema(
         # — Message writing —
         _field("saveMessages", "Save messages", KIND_BOOL, "Persist conversation messages to Honcho.",
                default="true", group="Message writing"),
+        _field("contextLine", "Context line", KIND_BOOL,
+               "Prepend a one-line thread context, written by the memory_context_line auxiliary model, to both "
+               "messages of each filed turn, so a vague turn is findable by meaning.",
+               default="false", group="Message writing"),
         _field("logging", "Injection audit log", KIND_BOOL,
                "Append what each turn injected, and why, to ~/.honcho/injection.log. The record holds the user's "
                "representation verbatim.", default="false", group="Recall"),

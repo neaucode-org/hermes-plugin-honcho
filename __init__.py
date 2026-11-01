@@ -25,6 +25,7 @@ from agent.turn_author import a2a_key
 from .client import HonchoClientConfig, resolve_config_path
 from .client import _host_block, _HostLookup
 from .client import join_plugin_threads, spawn_context_thread
+from ._context_line import context_line, register_context_line_task
 from .dialectic import DialecticMixin
 from .session_peers import assistant_peer_id_for, sanitize_peer_id
 from .session_context import usable_honcho_summary
@@ -847,13 +848,20 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             author_peer_id = self._manager.resolve_author_peer_id(session_key, author.get("id"), author.get("name"))
 
         user_row_id, assistant_row_id = _turn_row_ids(messages)
+        # A snapshot: the harness appends the next turn to this list while the thread runs.
+        thread_messages = list(messages or ()) if getattr(self._config, "context_line", False) else None
 
         def _sync():
             session = self._manager.get_or_create(session_key, **session_kwargs)
-            for chunk in self._chunk_message(clean_user_content, msg_limit) if clean_user_content else ():
+            line = ("" if thread_messages is None else
+                    self._context_line(session, clean_user_content, clean_assistant_content, thread_messages))
+            # Prepended before chunking, so the line lands on the first chunk only.
+            user_text, reply_text = (f"{line}\n\n{text}" if line and text else text
+                                     for text in (clean_user_content, clean_assistant_content))
+            for chunk in self._chunk_message(user_text, msg_limit) if user_text else ():
                 session.add_message("user", chunk, author_peer_id=author_peer_id, metadata={
                     "hermes_session_id": session_id, "hermes_message_id": user_row_id})
-            for chunk in self._chunk_message(clean_assistant_content, msg_limit) if clean_assistant_content else ():
+            for chunk in self._chunk_message(reply_text, msg_limit) if reply_text else ():
                 session.add_message("assistant", chunk, metadata={
                     "hermes_session_id": session_id, "hermes_message_id": assistant_row_id})
             # save() (not _flush_session) so writeFrequency batching is honored.
@@ -862,6 +870,23 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
         self._sync_thread = self._spawn_write(_sync, "honcho-sync", "Honcho sync_turn failed: %s")
+
+    def _context_line(self, session: Any, user_content: str, assistant_content: str,
+                      messages: List[Dict[str, Any]]) -> str:
+        """The ``contextLine`` line for a turn being filed, or ``""``: a failure here never stops the turn.
+        The thread comes from the transcript plus Honcho's running session summary when one exists."""
+        try:
+            summaries = self._manager._sdk_session(session.honcho_session_id).summaries()
+            latest = summaries.short_summary or summaries.long_summary
+            summary = usable_honcho_summary(getattr(latest, "content", None))
+        except Exception as e:
+            logger.debug("Honcho session summary for the context line unavailable: %s", e)
+            summary = None
+        try:
+            return context_line(user_content, assistant_content, messages=messages, summary=summary)
+        except Exception as e:
+            logger.debug("Memory context line failed: %s", e)
+            return ""
 
     def _a2a_session_key(self, author: Dict[str, Any]) -> str:
         """Honcho session for one sender bot's turns into this agent, named from core's ``a2a_key``.
@@ -1125,6 +1150,7 @@ def register(ctx) -> None:
     from ._shared_query_rewrite import rewrite_memory_query
 
     ctx.register_memory_provider(HonchoMemoryProvider(query_rewriter=rewrite_memory_query))
+    register_context_line_task(ctx)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

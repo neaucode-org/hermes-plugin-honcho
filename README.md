@@ -106,6 +106,34 @@ task and module (`plugins/memory/query_rewrite.py`) are provider-agnostic —
 any memory provider can reuse them. `dialecticCadence` still controls how
 often the cycle runs.
 
+### Context line (opt-in)
+
+A vague turn ("ok do it", "yes") is unfindable by meaning on its own. With
+`contextLine: true`, `sync_turn` asks the `memory_context_line` auxiliary task
+for one line naming the thread and what the turn settled or asked, and files
+both messages of the turn as `<line>\n\n<original content>`:
+
+```
+[context] James approves adding the context line to Honcho turn filing behind the contextLine flag.
+
+ok do it
+```
+
+The line goes into the content, not metadata, because Honcho embeds content;
+it also shows in search excerpts. Inputs: the turn, the last three exchanges
+of the transcript (user messages and final replies; tool output and reasoning
+stay out) and Honcho's running session summary when one exists. The session
+title is not an input. The line is one sentence, at most 200 characters,
+beginning `[context] `; an empty, longer or failed result files the turn
+without it. Long content is chunked after the line is prepended, so the line
+sits on the first chunk only. The call runs in the background write thread
+after the reply is delivered. The plugin declares the task inheriting
+`auxiliary.title_generation` (a cheap model), until `auxiliary.memory_context_line`
+in config.yaml pins its own route; an undeclared task would run on the chat's
+own model. Module: `_context_line.py`; try it
+on past turns with `scripts/context_line_dry_run.py <session_id> <message_id>`
+(no Honcho writes).
+
 ### Cold Start vs Warm Session Prompts
 
 When latest-message rewriting is unavailable, dialectic pass 0 automatically
@@ -260,6 +288,7 @@ With multiple profiles: saving a root-cascading map asks whether the edit applie
 |-----|------|---------|-------------|
 | `writeFrequency` | string/int | `"async"` | `"async"` (background), `"turn"` (sync per turn), `"session"` (batch on end), or integer N (every N turns) |
 | `saveMessages` | bool | `true` | Persist messages to Honcho API. When `false`, all automatic writes are skipped — raw turns (`sync_turn`), conclusion mirroring (`on_memory_write`), and session-end/shutdown flushes — while read and tools paths stay fully functional. |
+| `contextLine` | bool | `false` | Prepend a one-line thread context to both messages of each filed turn (see [Context line](#context-line-opt-in)). One extra auxiliary-model call per turn, in the background write thread |
 
 ### Session Resolution
 
