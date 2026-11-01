@@ -143,3 +143,20 @@ def test_honcho_messages_remap_line_and_pointers(monkeypatch):
     out = rh.honcho_messages("old", [_m(1, "uid-501", "[context] stale\n\nhello")], "[context] new.", 25000)
     assert out == [{"peer_id": "james", "content": "[context] new.\n\nhello", "created_at": "2026-01-01T00:00:00Z",
                     "metadata": {"k": 1, "refiled_from_session": "old", "refiled_from_message": "m1"}}]
+
+
+def test_delete_targets_skip_a_snapshot_name_recreated_under_the_new_tags():
+    snap = {"taken_at": "2026-11-01T01:39:00+00:00",
+            "sessions": {"old": {}, "a834c5f8014c": {}, "jarvis": {}}}
+    members = {"old": {"james", "jarvis"},                   # snapshotted, renamed in place
+               "a834c5f8014c": {"james", "jarvis", "hermes"},  # same name, recreated after the rename
+               "jarvis": {"james", "jarvis"},                # per-directory key, recreated
+               "agent-x": {"jarvis", "hermes"},              # written on the old config after the rename
+               "live": {"james", "jarvis"},
+               "mail-1": {"james", "correspondent"},
+               "refiled-default-s1": {"james", "jarvis", "hermes"},
+               "devlog": {"jarvis", "hermes"}}
+    created = {"old": "2026-08-01T00:00:00Z", "a834c5f8014c": "2026-11-01T02:03:40.921548Z",
+               "jarvis": "2026-11-01T02:11:03Z", "agent-x": "2026-11-01T02:02:03Z"}
+    assert rh.delete_targets(members, created, snap) == ["agent-x", "old"]
+    assert rh.delete_targets(members, {}, snap) == ["agent-x"]  # unknown age never counts as stale

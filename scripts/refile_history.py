@@ -734,14 +734,36 @@ def apply_refile_honcho(h: Honcho, turns: List[Turn], snapshot_path: Path, write
     print(f"refile-honcho: {filed} old messages filed as {msgs_n} messages in {sessions} sessions")
 
 
+def delete_targets(members: Dict[str, set], created: Dict[str, str], snap: Dict[str, Any]) -> List[str]:
+    """The old-tag sessions: a snapshot session that still is the one snapshotted (created before
+    ``taken_at``; a live per-directory or per-session key recreated under the new tags reuses its name),
+    plus any session a process still on the old config wrote (a ``hermes`` member and no ``james``)."""
+    taken = snap.get("taken_at", "")
+    old = snap.get("sessions", {})
+
+    def stale(sid: str) -> bool:
+        return sid in old and bool(taken) and _utc(created.get(sid, "")) < _utc(taken)
+
+    return sorted(sid for sid, m in members.items() if not is_protected(sid, m) and (
+        stale(sid) or (OLD_AGENT_PEER in m and USER_PEER not in m)))
+
+
+def _utc(ts: str) -> dt.datetime:
+    """An ISO timestamp as aware UTC; empty or unparsable sorts last, so it never counts as stale."""
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+    except ValueError:
+        return dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+
+
 def apply_delete_old(h: Honcho, snapshot_path: Path, backup_dir: Path) -> None:
-    """Delete the old-tag sessions: the pre-rename snapshot, plus any session a process still on the old
-    config wrote after the rename (a ``hermes`` member and no ``james`` member). Mail threads, ``refiled-*``
-    and ``devlog`` are never touched. Every message goes to a backup jsonl first."""
+    """Delete the old-tag sessions (``delete_targets``). Mail threads, ``refiled-*`` and ``devlog`` are
+    never touched. Every message goes to a backup jsonl first."""
     members = session_members(h)
-    snap = json.loads(snapshot_path.read_text())["sessions"] if snapshot_path.exists() else {}
-    targets = sorted(sid for sid, m in members.items() if not is_protected(sid, m) and (
-        sid in snap or (OLD_AGENT_PEER in m and USER_PEER not in m)))
+    snap_all = json.loads(snapshot_path.read_text()) if snapshot_path.exists() else {}
+    snap = snap_all.get("sessions", {})
+    created = {s["id"]: s.get("created_at") or "" for s in h.pages("/sessions/list")}
+    targets = delete_targets(members, created, snap_all)
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup = backup_dir / f"honcho-refile-deleted-sessions-{dt.datetime.now():%Y%m%d-%H%M%S}.jsonl"
     n_msgs = 0
