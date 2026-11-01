@@ -92,3 +92,54 @@ def test_coverage_matches_by_pointer_or_text_and_flags_honcho_only_content():
     assert rh.classify_message({"content": "[continued] tail"}, keys, ids) == "continuation"
     assert rh.classify_message({"content": "<prior_memory_file>\n..."}, keys, ids) == "migration"
     assert rh.classify_message({"content": "a chat state.db no longer has"}, keys, ids) == "uncovered"
+
+
+# ----- phase B: rename SQL, Honcho-only turns -----
+
+def test_remap_peer_agent_tags_to_jarvis_everyone_else_to_james():
+    assert rh.remap_peer("jarvis") == "jarvis" and rh.remap_peer("hermes") == "jarvis"
+    assert {rh.remap_peer(p) for p in ("james", "8618229140", "uid-501", "basic-james", "api")} == {"james"}
+
+
+def test_rename_sql_is_one_transaction_in_order_with_checks():
+    sql = rh.rename_sql(["s1", "o'brien"])
+    assert sql.startswith("\\set ON_ERROR_STOP on\nBEGIN;") and sql.rstrip().endswith("COMMIT;")
+    assert sql.count("BEGIN;") == 1 and sql.count("COMMIT;") == 1
+    # jarvis -> james runs before hermes -> jarvis, on every peer column
+    first = sql.index("UPDATE peers SET name = 'james' WHERE workspace_name = 'hermes' AND name = 'jarvis';")
+    second = sql.index("UPDATE peers SET name = 'jarvis' WHERE workspace_name = 'hermes' AND name = 'hermes';")
+    assert first < second
+    for t, c in rh.PEER_COLUMNS:
+        assert f"UPDATE {t} SET {c} = 'james' WHERE workspace_name = 'hermes' AND {c} = 'jarvis';" in sql
+    assert "('o''brien')" in sql
+    assert "count mismatch after rename: rolled back" in sql
+    assert "UPDATE documents SET session_name = NULL" in sql  # facts survive the session delete
+
+
+def _m(i, peer, content, cls_hint=None):
+    return {"id": f"m{i}", "peer_id": peer, "content": content, "created_at": f"2026-01-0{i}T00:00:00Z",
+            "metadata": {"k": i}}
+
+
+def test_honcho_turns_pairs_runs_and_keeps_only_uncovered():
+    msgs = [_m(1, "james", "q1"), _m(2, "jarvis", "a1"),
+            _m(3, "8618229140", "q2"), _m(4, "jarvis", "a2"), _m(5, "jarvis", "[continued] a2b"),
+            _m(6, "james", "<prior_memory_file>x"), _m(7, "jarvis", "a3")]
+    classes = ["covered", "covered", "uncovered", "uncovered", "continuation", "migration", "uncovered"]
+    out = rh.honcho_turns("old", msgs, classes)
+    assert [[m["id"] for m in keep] for _, keep in out] == [["m3", "m4", "m5"], ["m7"]]
+    t, _ = out[0]
+    assert (t.user, t.reply, t.key) == ("q2", "a2\n\n[continued] a2b", "honcho/old/m3")
+    assert t.thread[:2] == [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+
+
+def test_honcho_messages_remap_line_and_pointers(monkeypatch):
+    class P:
+        class HonchoMemoryProvider:
+            @staticmethod
+            def _chunk_message(text, limit):
+                return [text]
+    monkeypatch.setattr(rh, "plugin", lambda: P)
+    out = rh.honcho_messages("old", [_m(1, "uid-501", "[context] stale\n\nhello")], "[context] new.", 25000)
+    assert out == [{"peer_id": "james", "content": "[context] new.\n\nhello", "created_at": "2026-01-01T00:00:00Z",
+                    "metadata": {"k": 1, "refiled_from_session": "old", "refiled_from_message": "m1"}}]

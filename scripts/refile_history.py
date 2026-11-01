@@ -19,10 +19,13 @@ Run with a Python that imports Hermes, e.g. the managed runtime venv:
 
     PY=$(ls -t ~/.hermes/installs/*/environments/*/venv/bin/python | head -1)
     $PY scripts/refile_history.py --dry-run --sample 30
-    $PY scripts/refile_history.py --apply conclusions --yes   # phase B, in the order the plan gives
+    # phase B, in this order, after a pg dump to ~/.hermes/backups/honcho-<ts>.dump:
+    $PY scripts/refile_history.py --apply rename --yes        # snapshot old sessions, rename peers in place
     $PY scripts/refile_history.py --apply devlog --yes
     $PY scripts/refile_history.py --apply refile --yes
-    $PY scripts/refile_history.py --apply delete-old --yes
+    $PY scripts/refile_history.py --apply refile-honcho --yes # the messages only Honcho holds
+    $PY scripts/refile_history.py --apply delete-old --yes    # also the catch-up after the restart
+    # --apply conclusions is the fallback when a rename is impossible (copies lose created_at)
 """
 
 from __future__ import annotations
@@ -496,22 +499,264 @@ def apply_refile(h: Honcho, turns: List[Turn], lines: Dict[str, Dict[str, Any]],
     print(f"refile: {filed} turns in {len(by_session)} sessions, {msgs} messages filed")
 
 
-def apply_delete_old(h: Honcho, inv: Dict[str, Any], backup_dir: Path) -> None:
-    """Delete only the old sessions whose every message the re-file wrote again, after writing each
-    one's messages to a backup jsonl. Deleting a session also deletes the conclusions bound to it,
-    so this runs after ``--apply conclusions``."""
+def session_members(h: Honcho) -> Dict[str, set]:
+    members: Dict[str, set] = collections.defaultdict(set)
+    for p in [p["id"] for p in h.pages("/peers/list")]:
+        for s in h.pages(f"/peers/{p}/sessions"):
+            members[s["id"]].add(p)
+    return members
+
+
+def is_protected(name: str, members: set) -> bool:
+    """Mail threads and the sessions this migration writes are never deleted or re-filed."""
+    return MAIL_PEER in members or name.startswith(SESSION_PREFIX) or name == DEVLOG_SESSION
+
+
+def snapshot_old_sessions(h: Honcho, path: Path) -> Dict[str, Any]:
+    """The old-tag sessions, taken once BEFORE the rename (afterwards every one of them has a ``james``
+    member, so membership no longer tells them apart): name -> members and metadata."""
+    if path.exists():
+        return json.loads(path.read_text())
+    members = session_members(h)
+    meta = {s["id"]: s.get("metadata") or {} for s in h.pages("/sessions/list")}
+    old = {sid: {"members": sorted(m), "metadata": meta.get(sid, {})} for sid, m in members.items()
+           if m and not is_protected(sid, m) and USER_PEER not in m}
+    snap = {"taken_at": dt.datetime.now(dt.timezone.utc).isoformat(), "sessions": old}
+    path.write_text(json.dumps(snap, indent=1, ensure_ascii=False))
+    print(f"snapshot: {len(old)} old-tag sessions written to {path}")
+    return snap
+
+
+# The rename: every column that holds a peer name in workspace ``hermes`` (Postgres keys peers by name,
+# the 8 foreign keys are NO ACTION and not deferrable, no triggers), old name -> new name, in this order.
+RENAME = ((OLD_USER_PEER, USER_PEER), (OLD_AGENT_PEER, AGENT_PEER))
+PEER_COLUMNS = (("peers", "name"), ("messages", "peer_name"), ("message_embeddings", "peer_name"),
+                ("session_peers", "peer_name"), ("collections", "observer"), ("collections", "observed"),
+                ("documents", "observer"), ("documents", "observed"))
+FK_TABLES = ("messages", "message_embeddings", "session_peers", "collections", "documents")
+
+
+def _q(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+
+def rename_sql(old_sessions: Iterable[str], workspace: str = "hermes") -> str:
+    """One transaction: count -> drop the FKs that reference peers/collections -> rename in place
+    (ids, dates and embeddings untouched) -> rename card keys -> detach the user's and the journal's
+    conclusions from the old sessions (deleting a session deletes the conclusions bound to it) ->
+    re-add the FKs (validating every row) -> recount under the mapping; any mismatch raises, so
+    psql's ON_ERROR_STOP rolls the whole transaction back."""
+    ws = _q(workspace)
+    case = "CASE {c} " + " ".join(f"WHEN {_q(o)} THEN {_q(n)}" for o, n in RENAME) + " ELSE {c} END"
+    def counts(mapped: bool) -> str:
+        m = (lambda c: case.format(c=c)) if mapped else (lambda c: c)
+        parts = [f"SELECT '{t}.{c}' AS col, {m(c)} AS k, count(*) AS n FROM {t} WHERE workspace_name = {ws} "
+                 f"GROUP BY 1, 2" if t != "peers" else
+                 f"SELECT 'peers.name' AS col, {m('name')} AS k, count(*) AS n FROM peers WHERE workspace_name = {ws} GROUP BY 1, 2"
+                 for t, c in PEER_COLUMNS]
+        parts.append(f"SELECT 'documents.pair', {m('observer')} || '>' || {m('observed')}, count(*) FROM documents "
+                     f"WHERE workspace_name = {ws} GROUP BY 1, 2")
+        parts.append(f"SELECT 'documents.created_at_sum', {m('observer')} || '>' || {m('observed')}, "
+                     f"sum(extract(epoch FROM created_at))::bigint FROM documents WHERE workspace_name = {ws} GROUP BY 1, 2")
+        parts.append(f"SELECT 'messages.created_at_sum', {m('peer_name')}, sum(extract(epoch FROM created_at))::bigint "
+                     f"FROM messages WHERE workspace_name = {ws} GROUP BY 1, 2")
+        card_peer = m("name")
+        parts.append(f"SELECT 'card.self', {card_peer}, coalesce(jsonb_array_length(internal_metadata->'peer_card'), 0) "
+                     f"FROM peers WHERE workspace_name = {ws}")
+        return "\nUNION ALL ".join(parts)
+    sessions = ",".join(f"({_q(s)})" for s in old_sessions) or "(NULL)"
+    detach_where = (f"workspace_name = {ws} AND session_name IN (SELECT name FROM old_sessions) AND "
+                    f"((observer = {_q(USER_PEER)} AND observed = {_q(USER_PEER)}) OR "
+                    f"(observer = {_q(DEVLOG_PEER)} AND observed = {_q(DEVLOG_PEER)}))")
+    renames = []
+    for old, new in RENAME:
+        for t, c in PEER_COLUMNS:
+            renames.append(f"UPDATE {t} SET {c} = {_q(new)} WHERE workspace_name = {ws} AND {c} = {_q(old)};")
+        renames.append(
+            f"UPDATE peers SET internal_metadata = (SELECT jsonb_object_agg(CASE k WHEN {_q(old + '_peer_card')} "
+            f"THEN {_q(new + '_peer_card')} ELSE k END, v) FROM jsonb_each(internal_metadata) e(k, v)) "
+            f"WHERE workspace_name = {ws} AND internal_metadata ? {_q(old + '_peer_card')};")
+    fk_tables = ", ".join(f"{_q(t)}::regclass" for t in FK_TABLES)
+    return f"""\\set ON_ERROR_STOP on
+BEGIN;
+SET LOCAL lock_timeout = '60s';
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM peers WHERE workspace_name = {ws} AND name = {_q(USER_PEER)}) THEN
+  RAISE EXCEPTION 'peer {USER_PEER} already exists: rename aborted'; END IF; END $$;
+CREATE TEMP TABLE old_sessions(name text PRIMARY KEY) ON COMMIT DROP;
+INSERT INTO old_sessions VALUES {sessions};
+CREATE TEMP TABLE fks ON COMMIT DROP AS SELECT conrelid::regclass::text AS tbl, conname, pg_get_constraintdef(oid) AS def
+  FROM pg_constraint WHERE contype = 'f' AND confrelid IN ('peers'::regclass, 'collections'::regclass)
+  AND conrelid IN ({fk_tables});
+CREATE TEMP TABLE before ON COMMIT DROP AS {counts(True)};
+CREATE TEMP TABLE detach_expected ON COMMIT DROP AS SELECT count(*) AS n FROM documents
+  WHERE {detach_where.replace(_q(USER_PEER) + ' AND observed = ' + _q(USER_PEER), _q(OLD_USER_PEER) + ' AND observed = ' + _q(OLD_USER_PEER))};
+DO $$ DECLARE r record; BEGIN FOR r IN SELECT * FROM fks LOOP
+  EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.tbl, r.conname); END LOOP; END $$;
+{chr(10).join(renames)}
+UPDATE documents SET session_name = NULL WHERE {detach_where};
+UPDATE workspaces SET configuration = jsonb_set(configuration, '{{reasoning,custom_instructions}}',
+  to_jsonb(replace(configuration->'reasoning'->>'custom_instructions', '(peer {OLD_USER_PEER})', '(peer {USER_PEER})')))
+  WHERE name = {ws} AND configuration->'reasoning'->>'custom_instructions' LIKE '%(peer {OLD_USER_PEER})%';
+DO $$ DECLARE r record; BEGIN FOR r IN SELECT * FROM fks ORDER BY tbl = 'documents', conname LOOP
+  EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.tbl, r.conname, r.def); END LOOP; END $$;
+CREATE TEMP TABLE after ON COMMIT DROP AS {counts(False)};
+SELECT coalesce(b.col, a.col) AS col, coalesce(b.k, a.k) AS peer, b.n AS before, a.n AS after
+  FROM before b FULL JOIN after a ON a.col = b.col AND a.k IS NOT DISTINCT FROM b.k
+  WHERE coalesce(b.col, a.col) NOT LIKE '%created_at_sum' ORDER BY 1, 2;
+SELECT (SELECT n FROM detach_expected) AS detach_expected,
+  (SELECT count(*) FROM documents WHERE workspace_name = {ws} AND observer = {_q(USER_PEER)} AND observed = {_q(USER_PEER)} AND session_name IS NULL) AS user_facts_sessionless,
+  (SELECT count(*) FROM fks) AS fks_readded;
+DO $$ BEGIN
+  IF EXISTS (SELECT * FROM before EXCEPT SELECT * FROM after) OR EXISTS (SELECT * FROM after EXCEPT SELECT * FROM before) THEN
+    RAISE EXCEPTION 'count mismatch after rename: rolled back'; END IF;
+  IF (SELECT count(*) FROM pg_constraint c JOIN fks f ON c.conname = f.conname AND pg_get_constraintdef(c.oid) = f.def) <> (SELECT count(*) FROM fks) THEN
+    RAISE EXCEPTION 'foreign keys not restored identically: rolled back'; END IF;
+  IF EXISTS (SELECT 1 FROM peers WHERE workspace_name = {ws} AND name = {_q(OLD_AGENT_PEER)}) THEN
+    RAISE EXCEPTION 'old agent tag still present: rolled back'; END IF;
+END $$;
+COMMIT;
+"""
+
+
+def apply_rename(h: Honcho, snapshot_path: Path, backup_dir: Path) -> None:
+    dumps = sorted(backup_dir.glob("honcho-2*.dump"), key=lambda p: p.stat().st_mtime)
+    if not dumps or time.time() - dumps[-1].stat().st_mtime > 6 * 3600:
+        sys.exit("rename: no pg dump in the last 6 h under ~/.hermes/backups (step 0 first)")
+    snap = snapshot_old_sessions(h, snapshot_path)
+    print(f"rename: {OLD_USER_PEER}->{USER_PEER}, {OLD_AGENT_PEER}->{AGENT_PEER}; backup {dumps[-1]}; "
+          f"{len(snap['sessions'])} old sessions (snapshot {snapshot_path})", flush=True)
+    import subprocess
+    sql = rename_sql(sorted(snap["sessions"]))
+    (snapshot_path.parent / "rename.sql").write_text(sql)
+    r = subprocess.run(["docker", "exec", "-i", "honcho-database-1", "psql", "-U", "postgres", "-d", "postgres"],
+                       input=sql, text=True, capture_output=True)
+    print(r.stdout)
+    if r.returncode or "ROLLBACK" in r.stdout or "ERROR" in r.stderr:
+        sys.exit(f"rename: FAILED, rolled back\n{r.stderr}")
+    print("rename: committed")
+
+
+# ----- Re-filing the Honcho-only messages (option B) -----
+
+def remap_peer(peer: str) -> str:
+    """After the rename the agent is ``jarvis``; ``hermes`` can only reappear from a process still on the
+    old config. Every other author (james and the aliases 8618229140, uid-501, basic-james, api) is James."""
+    return AGENT_PEER if peer in (AGENT_PEER, OLD_AGENT_PEER) else USER_PEER
+
+
+def honcho_turns(session: str, msgs: List[Dict[str, Any]], classes: List[str]) -> List[tuple]:
+    """``(Turn, messages to file)`` per turn of an old Honcho session, in its own message order: a run of
+    user-side messages, then the run of agent messages that answers it. A continuation chunk takes the
+    class of the message before it. Only turns holding an ``uncovered`` message are returned, with only
+    those messages (covered ones are filed from the transcript; migration pastes are dropped)."""
+    out: List[tuple] = []
+    resolved: List[str] = []
+    for c in classes:
+        resolved.append(resolved[-1] if c == "continuation" and resolved else c)
+    dialogue: List[Dict[str, Any]] = []
+    i, n = 0, len(msgs)
+    while i < n:
+        start = i
+        while i < n and remap_peer(msgs[i]["peer_id"]) == USER_PEER:
+            i += 1
+        while i < n and remap_peer(msgs[i]["peer_id"]) == AGENT_PEER:
+            i += 1
+        idx = list(range(start, i))
+        strip = lambda m: _CONTEXT_PREFIX_RE.sub("", (m.get("content") or "").lstrip())
+        user = "\n\n".join(strip(msgs[j]) for j in idx if remap_peer(msgs[j]["peer_id"]) == USER_PEER).strip()
+        reply = "\n\n".join(strip(msgs[j]) for j in idx if remap_peer(msgs[j]["peer_id"]) == AGENT_PEER).strip()
+        keep = [msgs[j] for j in idx if resolved[j] == "uncovered"]
+        if keep:
+            first = msgs[idx[0]]
+            turn = Turn(profile="honcho", source="honcho", session_id=session, user_id=first["id"],
+                        user_ts=0.0, user=user, reply_id=msgs[idx[-1]]["id"], reply_ts=0.0, reply=reply,
+                        thread=dialogue[-THREAD_ROWS:] + [{"role": "user", "content": user},
+                                                          {"role": "assistant", "content": reply}])
+            out.append((turn, keep))
+        dialogue += [{"role": "user" if remap_peer(msgs[j]["peer_id"]) == USER_PEER else "assistant",
+                      "content": strip(msgs[j])} for j in idx]
+    return out
+
+
+def honcho_messages(session: str, keep: List[Dict[str, Any]], line: str, limit: int) -> List[Dict[str, Any]]:
+    chunk = plugin().HonchoMemoryProvider._chunk_message
+    out = []
+    for m in keep:
+        text = _CONTEXT_PREFIX_RE.sub("", (m.get("content") or "").lstrip())
+        full = f"{line}\n\n{text}" if line else text
+        meta = {**(m.get("metadata") or {}), "refiled_from_session": session, "refiled_from_message": m["id"]}
+        out += [{"peer_id": remap_peer(m["peer_id"]), "content": c, "created_at": m["created_at"], "metadata": meta}
+                for c in chunk(full, limit)]
+    return out
+
+
+def plan_refile_honcho(h: Honcho, turns: List[Turn], snap: Dict[str, Any], done: set) -> Dict[str, List[tuple]]:
+    """Per old session, the ``(Turn, messages)`` still to file; prints the class counts. Reads only."""
+    keys, ids = coverage_index(turns)
+    with cf.ThreadPoolExecutor(8) as pool:
+        all_msgs = dict(zip(snap["sessions"], pool.map(
+            lambda s: list(h.pages(f"/sessions/{s}/messages/list")), snap["sessions"])))
+    cls_count: collections.Counter = collections.Counter()
+    plan: Dict[str, List[tuple]] = {}
+    for sid, msgs in all_msgs.items():
+        classes = [classify_message(m, keys, ids) for m in msgs]
+        cls_count.update(classes)
+        plan[sid] = [(t, [m for m in keep if m["id"] not in done]) for t, keep in honcho_turns(sid, msgs, classes)]
+        plan[sid] = [(t, keep) for t, keep in plan[sid] if keep]
+    todo = [t for ts in plan.values() for t, _ in ts]
+    print(f"refile-honcho: {sum(len(v) for v in all_msgs.values())} messages in {len(all_msgs)} old sessions "
+          f"{dict(cls_count)}; to file: {sum(len(k) for ts in plan.values() for _, k in ts)} messages in "
+          f"{len(todo)} turns of {sum(1 for v in plan.values() if v)} sessions", flush=True)
+    return plan
+
+
+def apply_refile_honcho(h: Honcho, turns: List[Turn], snapshot_path: Path, writer: "LineWriter",
+                        ledger: Path, limit: int) -> None:
+    snap = json.loads(snapshot_path.read_text())
+    done = set(ledger.read_text().splitlines()) if ledger.exists() else set()
+    plan = plan_refile_honcho(h, turns, snap, done)
+    lines = writer.write([t for ts in plan.values() for t, _ in ts])
+    filed = msgs_n = sessions = 0
+    for sid, ts in plan.items():
+        if not ts:
+            continue
+        name = honcho_session_name("honcho", sid)
+        _ensure_session(h, name, {**snap["sessions"][sid]["metadata"], "refiled_from_session": sid, "source": "honcho"})
+        batch, ids_done = [], []
+        for t, keep in ts:
+            batch += honcho_messages(sid, keep, lines.get(t.key, {}).get("line", ""), limit)
+            ids_done += [m["id"] for m in keep]
+        for i in range(0, len(batch), 100):
+            h.call("POST", f"/sessions/{name}/messages", {"messages": batch[i:i + 100]})
+        with ledger.open("a") as f:
+            f.writelines(x + "\n" for x in ids_done)
+        filed, msgs_n, sessions = filed + len(ids_done), msgs_n + len(batch), sessions + 1
+    print(f"refile-honcho: {filed} old messages filed as {msgs_n} messages in {sessions} sessions")
+
+
+def apply_delete_old(h: Honcho, snapshot_path: Path, backup_dir: Path) -> None:
+    """Delete the old-tag sessions: the pre-rename snapshot, plus any session a process still on the old
+    config wrote after the rename (a ``hermes`` member and no ``james`` member). Mail threads, ``refiled-*``
+    and ``devlog`` are never touched. Every message goes to a backup jsonl first."""
+    members = session_members(h)
+    snap = json.loads(snapshot_path.read_text())["sessions"] if snapshot_path.exists() else {}
+    targets = sorted(sid for sid, m in members.items() if not is_protected(sid, m) and (
+        sid in snap or (OLD_AGENT_PEER in m and USER_PEER not in m)))
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup = backup_dir / f"honcho-refile-deleted-sessions-{dt.datetime.now():%Y%m%d-%H%M%S}.jsonl"
+    n_msgs = 0
     with backup.open("w") as f:
-        for sid in inv["would_delete"]:
+        for sid in targets:
+            f.write(json.dumps({"session": sid, "members": sorted(members[sid]),
+                                "metadata": snap.get(sid, {}).get("metadata")}, ensure_ascii=False) + "\n")
             for m in h.pages(f"/sessions/{sid}/messages/list"):
                 f.write(json.dumps(m, ensure_ascii=False) + "\n")
-    for sid in inv["would_delete"]:
-        assert not sid.startswith(SESSION_PREFIX) and sid != DEVLOG_SESSION
+                n_msgs += 1
+    print(f"delete-old: backup {backup} ({len(targets)} sessions, {n_msgs} messages)", flush=True)
+    for sid in targets:
+        assert not is_protected(sid, members[sid])
         h.call("DELETE", f"/sessions/{sid}")
-    print(f"delete-old: {len(inv['would_delete'])} sessions queued for deletion ({inv['would_delete_messages']} "
-          f"messages, backup {backup}); kept: {len(inv['kept_uncovered'])} with uncovered content, "
-          f"{inv['keep'].get('mail', 0)} mail")
+    print(f"delete-old: {len(targets)} sessions queued for deletion; relies on backup {backup}")
 
 
 # ----- Reports -----
@@ -572,7 +817,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dry-run", action="store_true", help="default: inventory + sample lines; writes nothing to Honcho")
     ap.add_argument("--sample", type=int, default=30)
-    ap.add_argument("--apply", choices=("conclusions", "devlog", "refile", "delete-old"))
+    ap.add_argument("--apply", choices=("rename", "conclusions", "devlog", "refile", "refile-honcho", "delete-old"))
     ap.add_argument("--yes", action="store_true", help="required with --apply")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("HERMES_HOME", HERMES_HOME))
@@ -586,6 +831,9 @@ def main() -> None:
     cache = args.cache_dir / "lines.jsonl"
     h = Honcho()
 
+    snapshot = args.cache_dir / "old_sessions.json"
+    if args.apply == "rename":
+        return apply_rename(h, snapshot, HERMES_HOME / "backups")
     if args.apply == "conclusions":
         return apply_conclusions(h)
     if args.apply == "devlog":
@@ -593,8 +841,10 @@ def main() -> None:
     skipped: collections.Counter = collections.Counter()
     turns = load_turns(skipped)
     if args.apply == "delete-old":
-        return apply_delete_old(h, inventory_honcho(h, turns), HERMES_HOME / "backups")
+        return apply_delete_old(h, snapshot, HERMES_HOME / "backups")
     writer = LineWriter(cache, args.workers)
+    if args.apply == "refile-honcho":
+        return apply_refile_honcho(h, turns, snapshot, writer, args.cache_dir / "filed_honcho.txt", limit)
     if args.apply == "refile":
         print(f"refile: writing lines for {len(turns)} turns (cache {cache})", flush=True)
         lines = writer.write(turns)
