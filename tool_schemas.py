@@ -33,11 +33,11 @@ PROFILE_SCHEMA = _tool(
 
 SEARCH_SCHEMA = _tool(
     "honcho_search",
-    "Hybrid (semantic + keyword) search over a peer's actual message "
-    "history across ALL past sessions they took part in — not just the "
-    "current one. Returns RRF-ranked raw message excerpts (what was "
-    "literally said, including the assistant's own messages about the "
-    "peer), no LLM synthesis. Cheaper and faster than honcho_reasoning. "
+    "Hybrid (semantic + keyword) search over the actual message history "
+    "of the whole workspace — every author, ALL past sessions, not just "
+    "the current one. Returns RRF-ranked raw message excerpts (what was "
+    "literally said, user and assistant turns alike, each labelled with "
+    "its author), no LLM synthesis. Cheaper and faster than honcho_reasoning. "
     "Use this to recall specific past facts — 'what did I say about X', "
     "'what was the regimen/decision/config we settled on' — and reason "
     "over the excerpts yourself. For nuanced questions needing synthesis, "
@@ -47,7 +47,7 @@ SEARCH_SCHEMA = _tool(
      "max_tokens": {"type": "integer",
                     "description": "Approximate budget for returned excerpts (default 800, max 2000). Larger budgets return more/longer ranked snippets."},
      "peer": {"type": "string",
-              "description": "Whose history to search. Built-in aliases: 'user' (default), 'ai'. Or pass any peer ID from this workspace. Spans every session that peer took part in."}},
+              "description": "Optional filter. Omit to search the whole workspace (every author, every session). Pass a peer to narrow to the messages that peer saw, across every session it took part in: built-in aliases 'user', 'ai', or any peer ID from this workspace."}},
     ["query"],
 )
 

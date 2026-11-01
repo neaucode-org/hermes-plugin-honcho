@@ -156,12 +156,12 @@ The auto-injected dialectic scales `dialecticReasoningLevel` by query length: +1
 
 ## Tools
 
-Five bidirectional tools. All accept an optional `peer` parameter (`"user"` or `"ai"`, default `"user"`).
+Five bidirectional tools. All accept an optional `peer` parameter (`"user"` or `"ai"`). Four default it to `"user"`; `honcho_search` has no default and searches the whole workspace when `peer` is omitted.
 
 | Tool | LLM call? | Description |
 |------|-----------|-------------|
 | `honcho_profile` | No | Peer card — key facts snapshot |
-| `honcho_search` | No | Cross-session message search (hybrid semantic + keyword, ranked excerpts; 800 tok default, 2000 max); hits name their Hermes session and `state.db` message row |
+| `honcho_search` | No | Workspace-wide message search, every author and session; `peer` narrows it to one peer's view (hybrid semantic + keyword, ranked excerpts; 800 tok default, 2000 max); hits name their Hermes session and `state.db` message row |
 | `honcho_context` | No | Full session context: summary, representation, card, messages |
 | `honcho_reasoning` | Yes | LLM-synthesized answer via dialectic `.chat()` |
 | `honcho_conclude` | No | Write, list/search, or delete persistent conclusions (list surfaces the ids delete needs) |

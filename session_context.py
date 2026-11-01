@@ -222,30 +222,40 @@ class SessionContextMixin:
         return self._guarded_session(session_key, _fetch, [], logging.DEBUG, "Failed to fetch peer card from Honcho: %s")
 
     def search_context(
-        self, session_key: str, query: str, max_tokens: int = 800, peer: str = "user", raise_errors: bool = False,
+        self, session_key: str, query: str, max_tokens: int = 800, peer: str | None = "user",
+        raise_errors: bool = False,
     ) -> str:
-        """Hybrid search over raw messages visible from ``peer``'s perspective, all sessions. Snippets
-        accumulate until ``max_tokens`` (~4 chars/token) is exhausted. Returns "" when nothing matches;
-        raises HonchoAuthError on rejected credentials. ``raise_errors`` re-raises the fallback's backend
-        failure (both searches failed) instead of returning "", so the honcho_search tool can tell a
-        failed lookup from a miss."""
+        """Hybrid search over raw messages, all sessions: the whole workspace (every author, no
+        perspective filter) when ``peer`` is None, else the messages visible from ``peer``'s perspective.
+        Snippets accumulate until ``max_tokens`` (~4 chars/token) is exhausted. Returns "" when nothing
+        matches; raises HonchoAuthError on rejected credentials. ``raise_errors`` re-raises the backend
+        failure (for a peer, both searches failed) instead of returning "", so the honcho_search tool can
+        tell a failed lookup from a miss."""
         session = self._cached_session(session_key)
         q = (query or "").strip()[:4000]  # Honcho caps query length for the embedding model.
         if not session or not q:
             return ""
-        peer_id = self._resolve_peer_id(session, peer)
         char_budget = max(200, int(max_tokens) * 4)
         limit = max(3, min(20, char_budget // 300))
-        messages = self._guarded_authed(
-            "message search", lambda: self.honcho.search(q, filters={"peer_perspective": peer_id}, limit=limit),
-            _FAILED, logging.DEBUG, "Honcho message search failed (peer_perspective=%s): %s", peer_id,
-        )
-        if messages is _FAILED:
-            # Older Honcho versions lack the perspective filter; fall back to peer-authored search.
-            def _peer_search() -> Any:
-                return self._authed_call("peer search", lambda: self._get_or_create_peer(peer_id).search(q, limit=limit))
-            messages = _peer_search() if raise_errors else self._guarded(
-                _peer_search, None, logging.DEBUG, "Honcho peer search fallback also failed: %s")
+        if peer is None:
+            # One index over the workspace: turns by every author, in every session.
+            def _workspace_search() -> Any:
+                return self._authed_call("workspace search", lambda: self.honcho.search(q, limit=limit))
+            messages = _workspace_search() if raise_errors else self._guarded(
+                _workspace_search, None, logging.DEBUG, "Honcho workspace search failed: %s")
+        else:
+            peer_id = self._resolve_peer_id(session, peer)
+            messages = self._guarded_authed(
+                "message search", lambda: self.honcho.search(q, filters={"peer_perspective": peer_id}, limit=limit),
+                _FAILED, logging.DEBUG, "Honcho message search failed (peer_perspective=%s): %s", peer_id,
+            )
+            if messages is _FAILED:
+                # Older Honcho versions lack the perspective filter; fall back to peer-authored search.
+                def _peer_search() -> Any:
+                    return self._authed_call(
+                        "peer search", lambda: self._get_or_create_peer(peer_id).search(q, limit=limit))
+                messages = _peer_search() if raise_errors else self._guarded(
+                    _peer_search, None, logging.DEBUG, "Honcho peer search fallback also failed: %s")
         if not messages:
             return ""
         # Author labels distinguish user-stated facts from assistant-derived ones.

@@ -967,7 +967,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if not (query := (args.get("query") or "").strip()):
             return tool_error("Missing required parameter: query")
         max_tokens = min(int(args.get("max_tokens", 800)), 2000)
-        manager, session_key, peer = self._manager, self._session_key, args.get("peer", "user")
+        # No peer searches the whole workspace; a peer narrows to what that peer saw.
+        manager, session_key, peer = self._manager, self._session_key, (args.get("peer") or None)
         # The SDK has no per-call timeout: run the search on an owned daemon thread and stop waiting at the
         # cap. A late thread finishes on its own (bounded by the HTTP timeout) and shutdown joins it.
         box: dict[str, Any] = {}
