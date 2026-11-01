@@ -4,9 +4,12 @@ and coverage decides which old Honcho messages the re-file writes again."""
 from __future__ import annotations
 
 import collections
+import datetime as dt
 import importlib.util
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("refile_history_under_test", ROOT / "scripts" / "refile_history.py")
@@ -160,3 +163,63 @@ def test_delete_targets_skip_a_snapshot_name_recreated_under_the_new_tags():
                "jarvis": "2026-11-01T02:11:03Z", "agent-x": "2026-11-01T02:02:03Z"}
     assert rh.delete_targets(members, created, snap) == ["agent-x", "old"]
     assert rh.delete_targets(members, {}, snap) == ["agent-x"]  # unknown age never counts as stale
+
+
+# ----- --before: the live plugin owns every turn from the restart on -----
+
+CUTOFF = "2026-10-31T19:10:00-07:00"
+EDGE = dt.datetime.fromisoformat(CUTOFF).timestamp()
+
+
+def _turn(uid, user_ts, reply_ts):
+    return rh.Turn(profile="default", source="webui", session_id="s1", user_id=uid, user_ts=user_ts,
+                   user="q", reply_id=uid + 1, reply_ts=reply_ts, reply="a")
+
+
+@pytest.mark.parametrize("mode", rh.FILING_MODES)
+@pytest.mark.parametrize("extra", [[], ["--before", "yesterday"], ["--before", "2026-10-31T19:10:00"]],
+                         ids=["missing", "unparsable", "no-offset"])
+def test_filing_apply_without_a_valid_before_exits_before_any_network_call(monkeypatch, mode, extra):
+    def no_network(*a, **k):
+        raise AssertionError("Honcho client built before the --before check")
+    monkeypatch.setattr(rh, "Honcho", no_network)
+    monkeypatch.setattr(rh, "load_turns", no_network)
+    monkeypatch.setattr(sys, "argv", ["refile_history.py", "--apply", mode, "--yes", *extra])
+    with pytest.raises(SystemExit) as exc:
+        rh.main()
+    assert exc.value.code not in (0, None)
+
+
+def test_parse_cutoff_is_aware_utc():
+    assert rh.parse_cutoff(CUTOFF) == dt.datetime(2026, 11, 1, 2, 10, tzinfo=dt.timezone.utc)
+    assert rh.parse_cutoff("2026-11-01T02:10:00Z") == rh.parse_cutoff(CUTOFF)
+
+
+def test_turn_at_or_after_the_cutoff_is_excluded_and_one_before_is_included():
+    before = _turn(1, EDGE - 60, EDGE - 1)
+    at = _turn(3, EDGE - 60, EDGE)              # answered exactly at the cutoff
+    after = _turn(5, EDGE + 5, EDGE + 30)
+    straddles = _turn(7, EDGE - 30, EDGE + 30)  # asked before, answered after: the live plugin filed it
+    kept, excluded = rh.split_at_cutoff([before, at, after, straddles], rh.parse_cutoff(CUTOFF))
+    assert [t.user_id for t in kept] == [1]
+    assert [t.user_id for t in excluded] == [3, 5, 7]
+
+
+def test_message_before_cutoff_and_unknown_dates_count_as_after():
+    cutoff = rh.parse_cutoff(CUTOFF)
+    assert rh.message_before({"created_at": "2026-11-01T02:09:59Z"}, cutoff)
+    assert not rh.message_before({"created_at": "2026-11-01T02:10:00Z"}, cutoff)
+    assert not rh.message_before({"created_at": ""}, cutoff) and not rh.message_before({}, cutoff)
+
+
+def test_refile_honcho_plan_drops_messages_at_or_after_the_cutoff():
+    msgs = [{"id": "m1", "peer_id": "james", "content": "old q", "created_at": "2026-10-30T00:00:00Z"},
+            {"id": "m2", "peer_id": "jarvis", "content": "old a", "created_at": "2026-10-30T00:00:01Z"},
+            {"id": "m3", "peer_id": "james", "content": "new q", "created_at": "2026-11-01T02:10:00Z"},
+            {"id": "m4", "peer_id": "jarvis", "content": "new a", "created_at": "2026-11-01T03:00:00Z"}]
+
+    class H:
+        def pages(self, path, body=None, size=100):
+            return iter(msgs)
+    plan = rh.plan_refile_honcho(H(), [], {"sessions": {"old": {}}}, set(), rh.parse_cutoff(CUTOFF))
+    assert [[m["id"] for m in keep] for _, keep in plan["old"]] == [["m1", "m2"]]

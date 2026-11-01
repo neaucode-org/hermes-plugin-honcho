@@ -19,13 +19,25 @@ Run with a Python that imports Hermes, e.g. the managed runtime venv:
 
     PY=$(ls -t ~/.hermes/installs/*/environments/*/venv/bin/python | head -1)
     $PY scripts/refile_history.py --dry-run --sample 30
+    $PY scripts/refile_history.py --dry-run --before "$BEFORE" --sample 30   # also counts what the cutoff drops
     # phase B, in this order, after a pg dump to ~/.hermes/backups/honcho-<ts>.dump:
     $PY scripts/refile_history.py --apply rename --yes        # snapshot old sessions, rename peers in place
     $PY scripts/refile_history.py --apply devlog --yes
-    $PY scripts/refile_history.py --apply refile --yes
-    $PY scripts/refile_history.py --apply refile-honcho --yes # the messages only Honcho holds
+    $PY scripts/refile_history.py --apply refile --before "$BEFORE" --yes
+    $PY scripts/refile_history.py --apply refile-honcho --before "$BEFORE" --yes # the messages only Honcho holds
     $PY scripts/refile_history.py --apply delete-old --yes    # also the catch-up after the restart
     # --apply conclusions is the fallback when a rename is impossible (copies lose created_at)
+
+``--before`` is required by the two modes that file messages (``refile``, ``refile-honcho``): only turns
+answered, and Honcho messages created, strictly before it are filed. The live plugin files every turn
+since the gateway/WebUI restart onto the new tags itself, and the ledgers know only what this script
+filed, so without the cutoff a re-run files those turns a second time. The value to pass on this
+install is the restart, 2026-10-31 ~19:10 PDT:
+
+    BEFORE=2026-10-31T19:10:00-07:00
+
+It is an ISO 8601 timestamp with a UTC offset; a missing, unparsable or offset-less value exits non-zero
+before any network call.
 """
 
 from __future__ import annotations
@@ -246,6 +258,38 @@ def load_turns(skipped: collections.Counter) -> List[Turn]:
             turns += walk_turns(rows, profile=profile, source=sources[sid], session_id=sid,
                                 is_internal=pkg._is_internal_gateway_turn, clean=sanitize_context, skipped=skipped)
     return turns
+
+
+# ----- Cutoff (pure): the live plugin owns every turn from the restart on -----
+
+FILING_MODES = ("refile", "refile-honcho")
+
+
+def parse_cutoff(value: str) -> dt.datetime:
+    """``--before``: an ISO 8601 timestamp with a UTC offset, as aware UTC. An offset-less value is
+    refused, since the host's zone would otherwise decide the cutoff silently."""
+    try:
+        cutoff = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an ISO 8601 timestamp: {value!r}") from None
+    if cutoff.tzinfo is None:
+        raise argparse.ArgumentTypeError(f"needs a UTC offset, e.g. 2026-10-31T19:10:00-07:00: {value!r}")
+    return cutoff.astimezone(dt.timezone.utc)
+
+
+def split_at_cutoff(turns: Iterable[Turn], cutoff: dt.datetime) -> tuple[List[Turn], List[Turn]]:
+    """``(before, excluded)``. A turn is before the cutoff when its last row is: the live plugin files a
+    turn when its reply lands, so a turn answered at or after the cutoff is the plugin's to file."""
+    edge = cutoff.timestamp()
+    before, excluded = [], []
+    for t in turns:
+        (before if max(t.user_ts, t.reply_ts) < edge else excluded).append(t)
+    return before, excluded
+
+
+def message_before(msg: Dict[str, Any], cutoff: dt.datetime) -> bool:
+    """A Honcho message created strictly before the cutoff; an unknown date counts as after it."""
+    return _utc(msg.get("created_at") or "") < cutoff
 
 
 def stratum(turn: Turn) -> str:
@@ -690,8 +734,11 @@ def honcho_messages(session: str, keep: List[Dict[str, Any]], line: str, limit: 
     return out
 
 
-def plan_refile_honcho(h: Honcho, turns: List[Turn], snap: Dict[str, Any], done: set) -> Dict[str, List[tuple]]:
-    """Per old session, the ``(Turn, messages)`` still to file; prints the class counts. Reads only."""
+def plan_refile_honcho(h: Honcho, turns: List[Turn], snap: Dict[str, Any], done: set,
+                       cutoff: dt.datetime) -> Dict[str, List[tuple]]:
+    """Per old session, the ``(Turn, messages)`` still to file: not in the ledger and created before the
+    cutoff. ``turns`` is the whole transcript, cutoff or not, since coverage asks what Hermes holds.
+    Prints the class counts. Reads only."""
     keys, ids = coverage_index(turns)
     with cf.ThreadPoolExecutor(8) as pool:
         all_msgs = dict(zip(snap["sessions"], pool.map(
@@ -701,7 +748,8 @@ def plan_refile_honcho(h: Honcho, turns: List[Turn], snap: Dict[str, Any], done:
     for sid, msgs in all_msgs.items():
         classes = [classify_message(m, keys, ids) for m in msgs]
         cls_count.update(classes)
-        plan[sid] = [(t, [m for m in keep if m["id"] not in done]) for t, keep in honcho_turns(sid, msgs, classes)]
+        plan[sid] = [(t, [m for m in keep if m["id"] not in done and message_before(m, cutoff)])
+                     for t, keep in honcho_turns(sid, msgs, classes)]
         plan[sid] = [(t, keep) for t, keep in plan[sid] if keep]
     todo = [t for ts in plan.values() for t, _ in ts]
     print(f"refile-honcho: {sum(len(v) for v in all_msgs.values())} messages in {len(all_msgs)} old sessions "
@@ -711,10 +759,10 @@ def plan_refile_honcho(h: Honcho, turns: List[Turn], snap: Dict[str, Any], done:
 
 
 def apply_refile_honcho(h: Honcho, turns: List[Turn], snapshot_path: Path, writer: "LineWriter",
-                        ledger: Path, limit: int) -> None:
+                        ledger: Path, limit: int, cutoff: dt.datetime) -> None:
     snap = json.loads(snapshot_path.read_text())
     done = set(ledger.read_text().splitlines()) if ledger.exists() else set()
-    plan = plan_refile_honcho(h, turns, snap, done)
+    plan = plan_refile_honcho(h, turns, snap, done, cutoff)
     lines = writer.write([t for ts in plan.values() for t, _ in ts])
     filed = msgs_n = sessions = 0
     for sid, ts in plan.items():
@@ -841,12 +889,18 @@ def main() -> None:
     ap.add_argument("--sample", type=int, default=30)
     ap.add_argument("--apply", choices=("rename", "conclusions", "devlog", "refile", "refile-honcho", "delete-old"))
     ap.add_argument("--yes", action="store_true", help="required with --apply")
+    ap.add_argument("--before", type=parse_cutoff, metavar="ISO",
+                    help="file only turns answered strictly before this time; required by --apply "
+                         f"{' and '.join(FILING_MODES)}; on this install pass 2026-10-31T19:10:00-07:00 (the restart)")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("HERMES_HOME", HERMES_HOME))
                     / "cache" / "scratch" / "refile_history", help="line cache, ledgers and the inventory")
     args = ap.parse_args()
     if args.apply and (args.dry_run or not args.yes):
         sys.exit("--apply needs --yes and excludes --dry-run")
+    if args.apply in FILING_MODES and args.before is None:
+        sys.exit(f"--apply {args.apply} needs --before <ISO timestamp>: the live plugin files every turn from "
+                 "the restart on (here: --before 2026-10-31T19:10:00-07:00)")
 
     cfg = json.loads((HERMES_HOME / "honcho.json").read_text())
     limit = int(cfg.get("hosts", {}).get("hermes", {}).get("messageMaxChars") or cfg.get("messageMaxChars") or 25000)
@@ -866,15 +920,20 @@ def main() -> None:
         return apply_delete_old(h, snapshot, HERMES_HOME / "backups")
     writer = LineWriter(cache, args.workers)
     if args.apply == "refile-honcho":
-        return apply_refile_honcho(h, turns, snapshot, writer, args.cache_dir / "filed_honcho.txt", limit)
+        return apply_refile_honcho(h, turns, snapshot, writer, args.cache_dir / "filed_honcho.txt", limit, args.before)
+    to_file = turns
+    if args.before is not None:
+        to_file, excluded = split_at_cutoff(turns, args.before)
+        print(f"cutoff --before {args.before.isoformat()}: {len(excluded)} of {len(turns)} turns answered at or "
+              f"after it excluded, {len(to_file)} kept", flush=True)
     if args.apply == "refile":
-        print(f"refile: writing lines for {len(turns)} turns (cache {cache})", flush=True)
-        lines = writer.write(turns)
-        return apply_refile(h, turns, lines, args.cache_dir / "filed_turns.txt", limit)
+        print(f"refile: writing lines for {len(to_file)} turns (cache {cache})", flush=True)
+        lines = writer.write(to_file)
+        return apply_refile(h, to_file, lines, args.cache_dir / "filed_turns.txt", limit)
 
-    report_turns(turns, skipped, limit)
-    sample = sample_turns(turns, args.sample)
-    report_lines(sample, writer.write(sample), len(turns), writer.route)
+    report_turns(to_file, skipped, limit)
+    sample = sample_turns(to_file, args.sample)
+    report_lines(sample, writer.write(sample), len(to_file), writer.route)
     report_honcho(h, inventory_honcho(h, turns), args.cache_dir / "honcho_inventory.json")
 
 
