@@ -57,14 +57,31 @@ class FakeManager(session_context.SessionContextMixin):
         return operation()
 
 
-def _msg(peer_id, content, **meta):
-    return SimpleNamespace(peer_id=peer_id, content=content, session_id="s1", metadata=meta)
+def _msg(peer_id, content, created_at=None, **meta):
+    return SimpleNamespace(peer_id=peer_id, content=content, session_id="s1", metadata=meta, created_at=created_at)
 
 
 HITS = [
     _msg(USER, "did we fix the search?", hermes_session_id="hs1", hermes_message_id=7),
     _msg(AI, "search spans the whole workspace", hermes_session_id="hs1", hermes_message_id=8),
 ]
+
+
+def test_hit_label_carries_the_turns_local_day():
+    """A kept fact carries its date: the label shows created_at as a local YYYY-MM-DD, after the author."""
+    import datetime as dt
+    stamp = dt.datetime(2026, 9, 28, 12, 0, tzinfo=dt.timezone.utc)  # noon UTC: same day in any US zone
+    mgr = FakeManager([_msg(USER, "ok make the name dev sandbox 3", created_at=stamp, hermes_session_id="hs1", hermes_message_id=9)])
+    out = mgr.search_context("k", "sandbox", peer=None)
+    assert "[jarvis · 2026-09-28 · s1 · hermes_session_id=hs1 hermes_message_id=9] ok make" in out
+
+
+@pytest.mark.parametrize("stamp", ["2026-09-28T12:00:00Z", "not a date", None])
+def test_hit_date_tolerates_strings_and_absence(stamp):
+    mgr = FakeManager([_msg(USER, "x", created_at=stamp)])
+    out = mgr.search_context("k", "x", peer=None)
+    expected = "[jarvis · 2026-09-28 · s1] x" if stamp == "2026-09-28T12:00:00Z" else "[jarvis · s1] x"
+    assert out == expected
 
 
 @pytest.mark.parametrize("raise_errors", [False, True])

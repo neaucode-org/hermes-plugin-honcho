@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime
 from typing import Any, Callable
 
 from .session_auth import HonchoAuthError
@@ -11,6 +12,21 @@ from .session_auth import HonchoAuthError
 logger = logging.getLogger("plugins.memory.honcho.session")
 
 _FAILED = object()  # sentinel: a guarded call raised (distinct from a legitimately empty/None result)
+
+
+def _local_day(created_at: object) -> str:
+    """``YYYY-MM-DD`` of a Honcho timestamp in the local timezone, or "" when absent or unparseable.
+    Honcho returns tz-aware UTC datetimes; the SDK may also hand back an ISO string."""
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+    if not isinstance(created_at, datetime):
+        return ""
+    if created_at.tzinfo is not None:
+        created_at = created_at.astimezone()
+    return created_at.strftime("%Y-%m-%d")
 
 # Reasoning-channel markers a summarizer model can leave inside a persisted session summary.
 _THINK_BLOCK_RE = re.compile(
@@ -266,12 +282,14 @@ class SessionContextMixin:
                 continue
             author = getattr(m, "peer_id", "") or "unknown"
             who = "assistant" if author == session.assistant_peer_id else author
+            # The turn's own date (local day): a message is append-only, so created_at is its only date.
+            when = _local_day(getattr(m, "created_at", None))
             sess = getattr(m, "session_id", "") or ""
             meta = getattr(m, "metadata", None) or {}
             # Links the hit to its Hermes session and state.db messages.id row (stamped by sync_turn).
             link = " ".join(f"{k}={meta[k]}" for k in ("hermes_session_id", "hermes_message_id")
                             if isinstance(meta, dict) and meta.get(k) not in (None, ""))
-            label = " · ".join(part for part in (who, sess, link) if part)
+            label = " · ".join(part for part in (who, when, sess, link) if part)
             entry = f"[{label}] {content[:1200]}"
             # Budget left after the joined snippets so far plus the separator this entry would need.
             remaining = char_budget - len("\n\n".join(lines)) - (2 if lines else 0)
