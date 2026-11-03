@@ -44,7 +44,8 @@ def prefetch_sync(provider, query: str) -> str:
             not (provider._injection_frequency == "first-turn" and turn > 1)
             and turn - provider._last_context_turn >= provider._context_cadence
         )
-        dialectic_due = turn - provider._last_dialectic_turn >= provider._effective_cadence()
+        dialectic_due = (provider._dialectic_cadence > 0
+                         and turn - provider._last_dialectic_turn >= provider._effective_cadence())
         if not context_due and not dialectic_due:
             return ""
         # Resolve all mutable settings before starting the worker. The captured

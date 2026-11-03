@@ -53,7 +53,7 @@ Two independent layers, each on its own cadence:
 4. **AI Self-Representation** — Honcho's model of the AI peer
 5. **AI Identity Card** — AI peer facts
 
-**Layer 2 — Dialectic supplement** (fired every `dialecticCadence` turns):
+**Layer 2 — Dialectic supplement** (fired every `dialecticCadence` turns; `0` turns it off):
 Multi-pass `.chat()` reasoning about the user, appended after base context.
 
 Both layers are joined, then truncated to fit `contextTokens` budget via `_truncate_to_budget` (tokens × 4 chars, word-boundary safe).
@@ -390,7 +390,7 @@ Host key is derived from the active Hermes profile: `hermes` (default) or `herme
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `contextCadence` | int | `1` | Minimum turns between base context refreshes (session summary + representation + card) |
-| `dialecticCadence` | int | `1` | Minimum turns between dialectic `.chat()` firings |
+| `dialecticCadence` | int | `1` | Minimum turns between dialectic `.chat()` firings. `0` turns automatic dialectic off (session-start prewarm, first-turn and cadence prefetch, and `recallSync`); base context still injects and the `honcho_reasoning` tool still works |
 | `injectionFrequency` | string | `"every-turn"` | `"every-turn"` or `"first-turn"` (inject base context on the first user message only; the dialectic supplement keeps its own cadence) |
 | `injection.sessionStart` | list | unset | Which base-context sections to inject: any of `summary`, `peerRepresentation`, `peerCard`, `aiRepresentation`, `aiCard`. Unset injects all of them in that order. `[]` injects nothing. A host block with an `injection` object replaces the root pin wholesale |
 | `logging` | bool | `false` | Append one JSON record per turn to `~/.honcho/injection.log` saying what was injected and why. The file is owner-only and holds the user's representation verbatim. `HONCHO_LOGGING=1` also switches it on and `HONCHO_INJECTION_LOG=<path>` moves it |

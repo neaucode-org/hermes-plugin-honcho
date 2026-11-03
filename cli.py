@@ -992,7 +992,11 @@ def cmd_status(args) -> None:
     elif global_path.exists():
         print(f"  Fallback:       {global_path}  (exists, cross-app interop)")
 
-    dialectic_cadence = getattr(hcfg, "dialectic_cadence", None) or raw.get("dialecticCadence") or 1
+    dialectic_cadence = getattr(hcfg, "dialectic_cadence", None)
+    if dialectic_cadence is None:
+        dialectic_cadence = raw.get("dialecticCadence", 1)
+    dialectic_cad_label = (f"every {dialectic_cadence} turn{'s' if dialectic_cadence != 1 else ''}"
+                           if dialectic_cadence > 0 else "off (automatic dialectic disabled)")
     reasoning_cap = raw.get("reasoningLevelCap") or hcfg.reasoning_level_cap
     print(f"""  AI peer:        {hcfg.ai_peer}
   User peer:      {hcfg.peer_name or 'not set'}
@@ -1000,7 +1004,7 @@ def cmd_status(args) -> None:
   Session strat:  {hcfg.session_strategy}
   Recall mode:    {hcfg.recall_mode}
   Context budget: {hcfg.context_tokens or '(uncapped)'} tokens
-  Dialectic cad:  every {dialectic_cadence} turn{'s' if dialectic_cadence != 1 else ''}
+  Dialectic cad:  {dialectic_cad_label}
   Reasoning:      base={hcfg.dialectic_reasoning_level}, cap={reasoning_cap}, heuristic={'on' if hcfg.reasoning_heuristic else 'off'}
   Observation:    user(me={hcfg.user_observe_me},others={hcfg.user_observe_others}) ai(me={hcfg.ai_observe_me},others={hcfg.ai_observe_others})
   Write freq:     {hcfg.write_frequency}""")

@@ -64,10 +64,14 @@ class DialecticMixin:
 
     def _spawn_dialectic(
         self, query: str, *, thread_name: str, fired_at: int, log_label: str, use_query_rewrite: bool = True,
-    ) -> threading.Thread:
+    ) -> threading.Thread | None:
         """Start a background dialectic run that publishes into the pending-result slot. Only a
         non-empty result advances ``_last_dialectic_turn`` (so empty returns retry next turn) and
-        resets the empty streak; failures widen the backoff."""
+        resets the empty streak; failures widen the backoff. ``dialecticCadence: 0`` turns
+        automatic dialectic off (prewarm, first-turn and cadence prefetch all route here)."""
+        if self._dialectic_cadence <= 0:
+            logger.debug("Honcho %s skipped: dialecticCadence 0 turns automatic dialectic off", log_label)
+            return None
         def _run() -> None:
             try:
                 r = self._run_dialectic_depth(query, use_query_rewrite=use_query_rewrite)
